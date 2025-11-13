@@ -1,18 +1,11 @@
 # data_ingest.py
-
 import io
 import pandas as pd
 
 # ---------------------------
 # Constants & simple helpers
 # ---------------------------
-
 DATE_NAMES = {'date', 'dates', 'month', 'asof', 'as_of'}
-RET_NAME_ALIASES = {
-    'HY'   : ['EMBI GD HY','EMBI_HY','HY','EMBIGD HY','EMBI HY'],
-    'IG'   : ['EMBI GD IG','EMBI_IG','IG','EMBIGD IG','EMBI IG'],
-    'EMBI' : ['EMBI','EMBI GD','EMBI Global Diversified','EMBIGD','EMBI GD Total']
-}
 
 def _detect_date_col(df: pd.DataFrame) -> str:
     """Return the column name that looks like date."""
@@ -24,13 +17,13 @@ def _detect_date_col(df: pd.DataFrame) -> str:
 def _month_end_collapse(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
     """
     Set index to month-end and collapse duplicates within a month by 'last'.
-    This is robust to daily/irregular dates while preserving monthly cadence.
+    Robust to daily/irregular dates while preserving monthly cadence.
     """
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
     df = df.dropna(subset=[date_col])
     df = df.set_index(date_col).sort_index()
-    # Normalize to month-end
+    # Normalize to month-end stamps
     df.index = df.index.to_period('M').to_timestamp('M')
     return df.groupby(df.index).last()
 
@@ -60,16 +53,15 @@ def detect_sheets(xf: pd.ExcelFile):
         # Common variants for “raw variables”
         'raw': find({'inputs','raw','factors','variables','variables input','variables_input'}),
         # Z-Score tabs (include X-Scores alias)
-        'x'  : find({'x-scores','x_scores','xscores'}),
-        'z'  : find({'z-scores','z_scores','z','standardized'}),
+        'x' : find({'x-scores','x_scores','xscores'}),
+        'z' : find({'z-scores','z_scores','z','standardized'}),
         # Returns tab
         'ret': find({'returns','return','embi'})
     }
 
 # ---------------------------
-# Robust Z-Scores loader
+# Z / X scores loader
 # ---------------------------
-
 def _find_header_row(xf: pd.ExcelFile, sheet: str, max_scan: int = 12) -> int:
     """
     Scan the first `max_scan` rows to locate a header row by looking
@@ -122,7 +114,6 @@ def _load_z_or_x_scores(xf: pd.ExcelFile, drop_leading_zero_row: bool = True) ->
 
     # Optionally drop a leading all-zero row (common on Z-score tabs)
     if drop_leading_zero_row and len(df):
-        # Sum absolute values across factors (ignore NaNs)
         if df.iloc[0].fillna(0).abs().sum() == 0:
             df = df.iloc[1:].copy()
 
@@ -131,11 +122,9 @@ def _load_z_or_x_scores(xf: pd.ExcelFile, drop_leading_zero_row: bool = True) ->
 # ---------------------------
 # Public API
 # ---------------------------
-
 def load_variables(xf: pd.ExcelFile, prefer_raw: bool = True, minp_z: int = 24) -> pd.DataFrame:
     """
     Load the factor matrix for PCA/regime modelling.
-
     Behavior:
       1) If an X-Scores or Z-Scores tab exists, use it (preferred).
       2) Else, if `prefer_raw` is True and a raw 'Variables/Inputs' tab exists,
@@ -153,8 +142,10 @@ def load_variables(xf: pd.ExcelFile, prefer_raw: bool = True, minp_z: int = 24) 
         RAW = pd.read_excel(xf, sheet_name=sheets['raw'], engine='openpyxl')
         dc = _detect_date_col(RAW)
         RAW = _month_end_collapse(RAW, dc)
+        # Coerce numerics and remove incomplete rows so expanding stats behave well
         RAW = _coerce_numeric(RAW).dropna(how='all', axis=1)
-        RAW = RAW.dropna(how='any')  # ensure expanding stats behave well
+        RAW = RAW.dropna(how='any')
+
         mu = RAW.expanding(min_periods=minp_z).mean()
         sd = RAW.expanding(min_periods=minp_z).std(ddof=0)
         Z = (RAW - mu) / sd
@@ -163,47 +154,70 @@ def load_variables(xf: pd.ExcelFile, prefer_raw: bool = True, minp_z: int = 24) 
 
     # 3) Nothing suitable found
     raise ValueError(
-        "Workbook must contain 'X-Scores'/'Z-Scores' "
-        "or a raw 'Variables/Inputs' sheet."
+        "Workbook must contain 'X-Scores'/'Z-Scores' or a raw 'Variables/Inputs' sheet."
     )
 
 def load_returns(xf: pd.ExcelFile) -> pd.DataFrame:
     """
-    Load HY/IG/EMBI returns from the 'Returns' sheet. Keeps original logic but
-    ignores empty/unnamed columns and is resilient to duplicated date blocks.
+    Load HY/IG/EMBI *monthly returns* from the 'Returns' sheet.
+    **Prefers the .1 columns**: 'EMBI GD HY.1', 'EMBI GD IG.1', 'EMBI GD.1'.
+    Falls back to endswith('.1') detection, then to fixed positions (H/J/K ~ 7/9/11).
     """
     sheets = detect_sheets(xf)
     if sheets['ret'] is None:
         raise ValueError('Returns sheet not found.')
 
     R = pd.read_excel(xf, sheet_name=sheets['ret'], engine='openpyxl')
+    R.columns = [str(c).strip() for c in R.columns]
 
-    # Drop obviously empty/unnamed helper columns
-    R = R.loc[:, [c for c in R.columns
-                  if not (str(c).startswith('Unnamed') and R[c].isna().all())]]
-
-    # Find and normalize date column, collapse to ME
+    # Use the first/leftmost Date-like column as the master date
     dc = _detect_date_col(R)
     R = _month_end_collapse(R, dc)
 
-    # Coerce numerics (levels + returns are mixed; NaNs allowed)
-    R = _coerce_numeric(R).dropna(how='all', axis=1)
+    # Drop columns that are entirely NaN (duplicate Date columns become NaN after coercion)
+    drop_cols = [c for c in R.columns if R[c].isna().all()]
+    if drop_cols:
+        R = R.drop(columns=drop_cols)
 
-    # Build alias map (prefer columns that actually exist)
-    name_map, up = {}, {str(c).upper(): c for c in R.columns}
-    for k, aliases in RET_NAME_ALIASES.items():
-        for a in aliases:
-            if a.upper() in up:
-                name_map[k] = up[a.upper()]
-                break
+    # 1) Prefer explicit monthly return columns with '.1' suffix
+    preferred = {
+        'EMBI GD HY.1': 'EMBI GD HY',
+        'EMBI GD IG.1': 'EMBI GD IG',
+        'EMBI GD.1'  : 'EMBI GD',
+    }
+    have_pref = [k for k in preferred if k in R.columns]
+    if len(have_pref) == 3:
+        out = R[have_pref].rename(columns=preferred)
+    else:
+        # 2) Generic endswith('.1') detection for the three series
+        base_map = {}
+        for c in R.columns:
+            if c.endswith('.1'):
+                base = c[:-2]
+                if base in ['EMBI GD HY', 'EMBI GD IG', 'EMBI GD']:
+                    base_map[base] = c
+        if len(base_map) == 3:
+            out = R[[base_map['EMBI GD HY'], base_map['EMBI GD IG'], base_map['EMBI GD']]].copy()
+            out.columns = ['EMBI GD HY','EMBI GD IG','EMBI GD']
+        else:
+            # 3) Final positional fallback: columns H, J, K ≈ indices 7, 9, 11 (0-based)
+            idxs = [7, 9, 11]
+            cols = [R.columns[i] for i in idxs if i < len(R.columns)]
+            if len(cols) != 3:
+                raise ValueError(
+                    f"Could not robustly locate monthly return columns. Columns: {list(R.columns)}"
+                )
+            out = R[cols].copy()
+            out.columns = ['EMBI GD HY','EMBI GD IG','EMBI GD']
 
-    # Fallback to positional indexes if aliases not found (kept from original)
-    def col(df, i):
-        return df.columns[i] if i < len(df.columns) else None
-    if 'HY' not in name_map:   name_map['HY']   = col(R, 7)
-    if 'IG' not in name_map:   name_map['IG']   = col(R, 8)
-    if 'EMBI' not in name_map: name_map['EMBI'] = col(R, 11)
+    # Coerce to numeric returns
+    for c in out.columns:
+        out[c] = pd.to_numeric(out[c], errors='coerce')
 
-    out = R[[name_map['HY'], name_map['IG'], name_map['EMBI']]].copy()
-    out.columns = ['HY', 'IG', 'EMBI']
+    # Basic magnitude sanity-check (monthly returns should be small)
+    if (out.abs() > 2).any().any():
+        raise ValueError(
+            "Monthly return magnitudes look wrong—likely read levels instead of returns."
+        )
+
     return out
