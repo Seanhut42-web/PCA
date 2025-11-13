@@ -57,26 +57,64 @@ REGIME_COLORS = {
     # fallback color if label unknown
 }
 
-def shade_regime_bands(ax, reg: pd.Series, alpha: float = 0.15):
+import pandas as pd
+
+# You likely already have a palette; keep yours if present.
+REGIME_COLORS = {
+    "Goldilocks": "tab:green",
+    "Reflation" : "tab:orange",
+    "Stagflation": "tab:red",
+    "Deflation" : "tab:purple",
+    "ON"        : "tab:green",
+    "OFF"       : "tab:red",
+}
+
+def shade_regime_bands(ax, regime, alpha: float = 0.15):
     """
     Shade contiguous regime segments on the given axes.
-    reg: Series of labels indexed by datetime.
+
+    Parameters
+    ----------
+    ax : matplotlib Axes
+    regime : pandas Series or DataFrame
+        - If Series: labels indexed by datetime.
+        - If DataFrame: must contain ['Date','Regime'] or a single column.
+    alpha : float
+        Fill alpha.
+
+    Notes
+    -----
+    This version **does not use `.loc` on a DatetimeIndex** and is compatible
+    with callers that pass an index of timestamps (fixes AttributeError).
     """
+    # Coerce to a label Series on a DatetimeIndex
+    if isinstance(regime, pd.DataFrame):
+        df = regime.copy()
+        df.columns = [str(c).strip() for c in df.columns]
+        if 'Date' in df.columns and 'Regime' in df.columns:
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce')
+            df = df.dropna(subset=['Date']).set_index('Date')
+            reg = df['Regime']
+        else:
+            reg = df.squeeze()
+    else:
+        reg = regime
+
     if not isinstance(reg.index, pd.DatetimeIndex):
         reg.index = pd.to_datetime(reg.index, errors='coerce')
-        reg = reg.dropna()
+    reg = reg.dropna()
 
-    # Contiguous blocks where label is constant
+    # Group consecutive equal labels
     blocks = (reg != reg.shift()).cumsum()
     for _, idx in reg.groupby(blocks).groups.items():
-        idx = list(idx)                 # list of Timestamps
+        idx = list(idx)  # list of Timestamps
         if not idx:
             continue
         label = reg.loc[idx[0]]
         start_ts, end_ts = idx[0], idx[-1]
-        ax.axvspan(start_ts, end_ts, color=REGIME_COLORS.get(label, "lightgrey"),
+        ax.axvspan(start_ts, end_ts,
+                   color=REGIME_COLORS.get(label, "lightgrey"),
                    alpha=alpha, lw=0)
-
 # Persist to session (as before)
 st.session_state['PC'] = PC
 st.session_state['EVR'] = EVR

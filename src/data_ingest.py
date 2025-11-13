@@ -160,8 +160,12 @@ def load_variables(xf: pd.ExcelFile, prefer_raw: bool = True, minp_z: int = 24) 
 def load_returns(xf: pd.ExcelFile) -> pd.DataFrame:
     """
     Load HY/IG/EMBI *monthly returns* from the 'Returns' sheet.
-    **Prefers the .1 columns**: 'EMBI GD HY.1', 'EMBI GD IG.1', 'EMBI GD.1'.
-    Falls back to endswith('.1') detection, then to fixed positions (H/J/K ~ 7/9/11).
+
+    It **prefers the .1 columns**: 'EMBI GD HY.1', 'EMBI GD IG.1', 'EMBI GD.1'
+    (these are the monthly returns), falls back to endswith('.1') detection,
+    and finally (as a last resort) to fixed positions (H/J/K ≈ 7/9/11).
+
+    Returns a DataFrame indexed by Date with columns **['HY','IG','EMBI']**.
     """
     sheets = detect_sheets(xf)
     if sheets['ret'] is None:
@@ -181,9 +185,9 @@ def load_returns(xf: pd.ExcelFile) -> pd.DataFrame:
 
     # 1) Prefer explicit monthly return columns with '.1' suffix
     preferred = {
-        'EMBI GD HY.1': 'EMBI GD HY',
-        'EMBI GD IG.1': 'EMBI GD IG',
-        'EMBI GD.1'  : 'EMBI GD',
+        'EMBI GD HY.1': 'HY',
+        'EMBI GD IG.1': 'IG',
+        'EMBI GD.1'  : 'EMBI',
     }
     have_pref = [k for k in preferred if k in R.columns]
     if len(have_pref) == 3:
@@ -198,7 +202,7 @@ def load_returns(xf: pd.ExcelFile) -> pd.DataFrame:
                     base_map[base] = c
         if len(base_map) == 3:
             out = R[[base_map['EMBI GD HY'], base_map['EMBI GD IG'], base_map['EMBI GD']]].copy()
-            out.columns = ['EMBI GD HY','EMBI GD IG','EMBI GD']
+            out.columns = ['HY','IG','EMBI']
         else:
             # 3) Final positional fallback: columns H, J, K ≈ indices 7, 9, 11 (0-based)
             idxs = [7, 9, 11]
@@ -208,7 +212,7 @@ def load_returns(xf: pd.ExcelFile) -> pd.DataFrame:
                     f"Could not robustly locate monthly return columns. Columns: {list(R.columns)}"
                 )
             out = R[cols].copy()
-            out.columns = ['EMBI GD HY','EMBI GD IG','EMBI GD']
+            out.columns = ['HY','IG','EMBI']
 
     # Coerce to numeric returns
     for c in out.columns:
